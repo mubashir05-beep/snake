@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Triple Threat Snake Game</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <!-- First Page - Main Menu -->
+    <section class="page page1 background active">
+      <h1>Triple Threat Snake Game</h1>
+      <div class="button-container">
+        <button id="startGame">Start Game</button>
+        <button id="chooseMode">Choose Mode</button>
+        <button id="resetGame">Reset Game</button>
+      </div>
+    </section>
+
+    <!-- Second Page - Speed Selection -->
+    <section class="page page2 background">
+      <h2>Select Speed</h2>
+      <div class="button-container">
+        <button id="slow">Slow</button>
+        <button id="medium">Medium</button>
+        <button id="fast">Fast</button>
+      </div>
+      <img src="R.png" class="page-image" alt="Speed Options" />
+    </section>
+
+    <!-- Third Page - Control Mode Selection -->
+    <section class="page page3 background">
+      <h2>Choose Control Mode</h2>
+      <div class="control-options">
+        <button id="hand" class="control-button">
+          <img src="2345.png" alt="Keyboard Control" class="control-icon" />
+          <div>Keyboard</div>
+        </button>
+        <button id="eyes" class="control-button">
+          <img src="123.png" alt="Eye Tracking" class="control-icon" />
+          <div>Eye Tracking</div>
+        </button>
+        <button id="voice" class="control-button">
+          <img src="abcd.png" alt="Voice Control" class="control-icon" />
+          <div>Voice Control</div>
+        </button>
+      </div>
+      <img src="R.png" class="page-image" alt="Control Options" />
+    </section>
+
+    <!-- Game Page -->
+    <section class="page page4">
+      <div class="score-container">
+        <div class="score">Score: <span id="score">0</span></div>
+        <div class="score">Highest Score: <span id="highestScore">0</span></div>
+      </div>
+      <div class="button-container">
+        <button id="resumeGame">Pause / Resume</button>
+        <button id="backToMenu">Back to Menu</button>
+      </div>
+      <div class="game-container" id="gameContainer"></div>
+
+      <!-- Voice control UI elements -->
+      <div id="voiceControls" class="voice-controls">
+        <div class="voice-indicator">
+          <div class="voice-level" id="voiceLevel"></div>
+        </div>
+        <div class="voice-status" id="voiceStatus">Voice control inactive</div>
+        <div class="voice-command-log" id="voiceCommandLog">No commands detected yet</div>
+        <div class="voice-tips">
+          Say "up", "down", "left", "right" to move, or "stop/pause" to pause
+        </div>
+      </div>
+    </section>
+
+    <audio id="beepSound" src="beep1.mp3" preload="auto"></audio>
+    <script src="game.js"></script>
+  </body>
+</html>

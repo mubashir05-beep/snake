@@ -11,9 +11,18 @@ let isVoiceControlActive = false;
 let controlMode = "keyboard";
 let isPaused = false;
 let lastVoiceCommands = []; // Array to store last few commands
-const MAX_COMMAND_HISTORY = 5;
+const MAX_COMMAND_HISTORY = 10; // Increased history size
 let permissionRequested = false;
 let recognitionRestartTimer = null; // Track the timer for restarts
+let voiceRecognitionAttempts = 0;
+const MAX_RECOGNITION_ATTEMPTS = 5;
+let lastRecognizedCommand = null;
+let commandCooldown = false; // Prevent multiple rapid commands
+let audioContext = null;
+let analyser = null;
+let microphone = null;
+let isListening = false;
+let audioVisualizationFrame = null;
 
 // DOM elements
 const container = document.getElementById("gameContainer");
@@ -23,6 +32,28 @@ const voiceStatus = document.getElementById("voiceStatus");
 const voiceCommandLog = document.getElementById("voiceCommandLog");
 const scoreElement = document.getElementById("score");
 const beepSound = document.getElementById("beepSound");
+const audioVisualizer = document.getElementById("audioVisualizer") || createAudioVisualizer();
+
+// Create audio visualizer if it doesn't exist
+function createAudioVisualizer() {
+  const canvas = document.createElement("canvas");
+  canvas.id = "audioVisualizer";
+  canvas.width = 300;
+  canvas.height = 100;
+  canvas.style.width = "100%";
+  canvas.style.height = "100px";
+  canvas.style.backgroundColor = "#f0f0f0";
+  canvas.style.borderRadius = "4px";
+  canvas.style.marginTop = "10px";
+  
+  if (voiceControls) {
+    voiceControls.appendChild(canvas);
+  } else {
+    document.body.appendChild(canvas);
+  }
+  
+  return canvas;
+}
 
 // Get highest score from local storage
 const highestScore = localStorage.getItem("highestScore") || 0;
@@ -49,6 +80,9 @@ document.getElementById("backToMenu").addEventListener("click", () => {
   // Stop voice recognition if active
   stopVoiceRecognition();
 
+  // Clean up audio visualization
+  stopAudioVisualization();
+
   // Clear any pending recognition restart timers
   clearRecognitionTimer();
 
@@ -62,10 +96,56 @@ document.getElementById("backToMenu").addEventListener("click", () => {
   showPage(0);
 });
 
-// Initialize Web Speech API
-const SpeechRecognition = window.webkitSpeechRecognition || window.SpeechRecognition;
+// Initialize Web Speech API - global variable for recognition
 let recognition = null;
 let isRecognitionActive = false; // Track recognition state
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+// Pre-initialize speech recognition to avoid cold start issues
+function preInitializeSpeechRecognition() {
+  if (!SpeechRecognition) {
+    console.warn("Web Speech API is not supported in this browser.");
+    return false;
+  }
+  
+  try {
+    // Create an instance that we'll discard, just to warm up the API
+    const tempRecognition = new SpeechRecognition();
+    tempRecognition.continuous = true; // Changed to true for continuous recognition
+    tempRecognition.interimResults = true; // Get interim results for more responsiveness
+    tempRecognition.lang = "en-US";
+    
+    // Set dummy handlers
+    tempRecognition.onstart = () => {
+      console.log("Pre-initialization recognition started");
+      
+      // Stop it after a brief moment
+      setTimeout(() => {
+        try {
+          tempRecognition.stop();
+        } catch (e) {
+          console.warn("Error stopping pre-initialization recognition", e);
+        }
+      }, 300); // Increased from 100ms to 300ms for better initialization
+    };
+    
+    tempRecognition.onend = () => {
+      console.log("Pre-initialization recognition ended");
+    };
+    
+    tempRecognition.onerror = (e) => {
+      console.warn("Pre-initialization recognition error", e);
+    };
+    
+    // Try to start it briefly
+    tempRecognition.start();
+    console.log("Speech recognition pre-initialized");
+    return true;
+  } catch (error) {
+    console.error("Failed to pre-initialize speech recognition:", error);
+    return false;
+  }
+}
 
 // Clear any pending recognition restart timers
 function clearRecognitionTimer() {
@@ -75,27 +155,181 @@ function clearRecognitionTimer() {
   }
 }
 
-// Request microphone permission
-function requestMicrophonePermission() {
-  return new Promise((resolve, reject) => {
-    navigator.mediaDevices.getUserMedia({ audio: true })
-      .then(stream => {
-        // Stop the tracks immediately, we just needed the permission
-        stream.getTracks().forEach(track => track.stop());
-        permissionRequested = true;
-        resolve(true);
-      })
-      .catch(err => {
-        console.error("Microphone permission denied:", err);
-        reject(err);
-      });
-  });
+// Start audio visualization
+function startAudioVisualization(stream) {
+  // Create audio context if not already created
+  if (!audioContext) {
+    try {
+      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      analyser = audioContext.createAnalyser();
+      analyser.fftSize = 256;
+      
+      // Get microphone input
+      microphone = audioContext.createMediaStreamSource(stream);
+      microphone.connect(analyser);
+      
+      // Start visualization loop
+      visualizeAudio();
+      
+      isListening = true;
+      console.log("Audio visualization started");
+    } catch (error) {
+      console.error("Error starting audio visualization:", error);
+    }
+  }
 }
 
-// Stop voice recognition safely
+// Stop audio visualization
+function stopAudioVisualization() {
+  isListening = false;
+  
+  if (audioVisualizationFrame) {
+    cancelAnimationFrame(audioVisualizationFrame);
+    audioVisualizationFrame = null;
+  }
+  
+  // Disconnect and clean up audio nodes
+  if (microphone) {
+    microphone.disconnect();
+    microphone = null;
+  }
+  
+  if (analyser) {
+    analyser = null;
+  }
+  
+  if (audioContext && audioContext.state !== "closed") {
+    try {
+      // Some browsers don't support closing
+      if (typeof audioContext.close === 'function') {
+        audioContext.close();
+      }
+    } catch (error) {
+      console.warn("Error closing audio context:", error);
+    }
+    audioContext = null;
+  }
+  
+  console.log("Audio visualization stopped");
+  
+  // Clear canvas
+  const canvas = document.getElementById("audioVisualizer");
+  if (canvas) {
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+  }
+}
+
+// Visualize audio data
+function visualizeAudio() {
+  if (!isListening || !analyser || !audioContext) {
+    return;
+  }
+  
+  const canvas = document.getElementById("audioVisualizer");
+  if (!canvas) return;
+  
+  const ctx = canvas.getContext("2d");
+  const bufferLength = analyser.frequencyBinCount;
+  const dataArray = new Uint8Array(bufferLength);
+  
+  // Clear canvas
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  
+  // Get audio data
+  analyser.getByteFrequencyData(dataArray);
+  
+  // Calculate average volume
+  let average = 0;
+  let max = 0;
+  dataArray.forEach(value => {
+    average += value;
+    max = Math.max(max, value);
+  });
+  average /= bufferLength;
+  
+  // Update voice level indicator
+  if (voiceLevel) {
+    const volumePercentage = (average / 255) * 100;
+    voiceLevel.style.width = `${volumePercentage}%`;
+    
+    // Color changes based on volume
+    if (volumePercentage > 80) {
+      voiceLevel.style.backgroundColor = "#ff4444"; // Red for loud
+    } else if (volumePercentage > 40) {
+      voiceLevel.style.backgroundColor = "#4CAF50"; // Green for normal
+    } else {
+      voiceLevel.style.backgroundColor = "#2196F3"; // Blue for quiet
+    }
+  }
+  
+  // Draw visualization bars
+  const barWidth = (canvas.width / bufferLength) * 2.5;
+  let x = 0;
+  
+  ctx.fillStyle = "#2196F3"; // Default blue
+  
+  for (let i = 0; i < bufferLength; i++) {
+    const barHeight = (dataArray[i] / 255) * canvas.height;
+    
+    // Color gradient based on frequency
+    const hue = (i / bufferLength) * 360;
+    ctx.fillStyle = `hsl(${hue}, 70%, 60%)`;
+    
+    ctx.fillRect(x, canvas.height - barHeight, barWidth, barHeight);
+    x += barWidth + 1;
+  }
+  
+  // Continue visualization loop
+  audioVisualizationFrame = requestAnimationFrame(visualizeAudio);
+}
+
+// Request microphone permission with improved error handling
+async function requestMicrophonePermission() {
+  try {
+    const constraints = { 
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }
+    };
+    
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    
+    // Start audio visualization
+    startAudioVisualization(stream);
+    
+    permissionRequested = true;
+    voiceStatus.textContent = "Microphone access granted";
+    updateVoiceStatusIndicator(true);
+    
+    return stream;
+  } catch (err) {
+    console.error("Microphone permission denied:", err);
+    voiceStatus.textContent = "Microphone access denied";
+    updateVoiceStatusIndicator(false);
+    
+    // Show more specific error messages
+    if (err.name === 'NotAllowedError') {
+      alert("You need to allow microphone access for voice control to work. Please check your browser settings.");
+    } else if (err.name === 'NotFoundError') {
+      alert("No microphone detected. Please connect a microphone and try again.");
+    } else {
+      alert(`Microphone error: ${err.message || err.name}`);
+    }
+    
+    return null;
+  }
+}
+
+// Stop voice recognition safely - improved
 function stopVoiceRecognition() {
   // Clear any pending restart timers first
   clearRecognitionTimer();
+  
+  // Stop audio visualization
+  stopAudioVisualization();
   
   if (recognition && isRecognitionActive) {
     try {
@@ -107,11 +341,31 @@ function stopVoiceRecognition() {
       // Always mark as inactive
       isRecognitionActive = false;
       voiceStatus.textContent = "Voice control inactive";
+      updateVoiceStatusIndicator(false);
     }
   }
 }
 
-// Start voice recognition safely
+// Visual indicator for voice status
+function updateVoiceStatusIndicator(active) {
+  const indicator = document.createElement('span');
+  indicator.className = active ? 'status-indicator active' : 'status-indicator inactive';
+  
+  // Replace any existing indicator
+  const existingIndicator = voiceStatus.querySelector('.status-indicator');
+  if (existingIndicator) {
+    voiceStatus.removeChild(existingIndicator);
+  }
+  
+  voiceStatus.prepend(indicator);
+  
+  // Pulse animation for active indicator
+  if (active) {
+    indicator.classList.add('pulse');
+  }
+}
+
+// Start voice recognition safely - improved with better error handling and retry logic
 function startVoiceRecognition() {
   // Don't attempt to start if already active
   if (isRecognitionActive) {
@@ -122,49 +376,151 @@ function startVoiceRecognition() {
   // Clear any pending restart timers
   clearRecognitionTimer();
   
-  if (recognition && !isRecognitionActive) {
-    try {
-      recognition.start();
-      isRecognitionActive = true;
-      voiceStatus.textContent = "Voice control active";
-      console.log("Voice recognition started successfully");
-      return true;
-    } catch (error) {
-      console.error("Failed to start voice recognition:", error);
-      isRecognitionActive = false; // Ensure state is properly reset
-      voiceStatus.textContent = "Voice start failed - retrying soon";
-      
-      // Try again after a delay
-      clearRecognitionTimer(); // Clear any existing timers
-      recognitionRestartTimer = setTimeout(() => {
-        console.log("Attempting to restart voice recognition");
-        // Double-check that we're still not active
-        if (!isRecognitionActive && isVoiceControlActive && !isPaused) {
-          try {
-            recognition.start();
-            isRecognitionActive = true;
-            voiceStatus.textContent = "Voice control active";
-            console.log("Voice recognition restarted successfully");
-          } catch (innerError) {
-            isRecognitionActive = false;
-            voiceStatus.textContent = "Voice control failed";
-            console.error("Retry failed:", innerError);
-          }
-        }
-      }, 2000);
-      
+  // Check if recognition is available
+  if (!recognition) {
+    if (!createRecognitionInstance()) {
+      voiceStatus.textContent = "Failed to create recognition instance";
       return false;
     }
   }
-  return false;
+  
+  try {
+    recognition.start();
+    isRecognitionActive = true;
+    voiceStatus.textContent = "Voice control active";
+    updateVoiceStatusIndicator(true);
+    voiceRecognitionAttempts = 0; // Reset attempt counter on success
+    console.log("Voice recognition started successfully");
+    return true;
+  } catch (error) {
+    console.error("Failed to start voice recognition:", error);
+    isRecognitionActive = false; // Ensure state is properly reset
+    voiceStatus.textContent = "Voice start failed - retrying soon";
+    updateVoiceStatusIndicator(false);
+    
+    // Increment attempt counter
+    voiceRecognitionAttempts++;
+    
+    // If we've tried too many times in a row, recreate the instance
+    if (voiceRecognitionAttempts >= MAX_RECOGNITION_ATTEMPTS) {
+      console.log("Too many failed attempts, recreating recognition instance");
+      createRecognitionInstance();
+      voiceRecognitionAttempts = 0;
+    }
+    
+    // Try again after a delay
+    clearRecognitionTimer(); // Clear any existing timers
+    recognitionRestartTimer = setTimeout(() => {
+      console.log("Attempting to restart voice recognition");
+      // Double-check that we're still not active and should be running
+      if (!isRecognitionActive && isVoiceControlActive && !isPaused) {
+        startVoiceRecognition();
+      }
+    }, 1000); // Reduced from 2000ms to 1000ms for faster recovery
+    
+    return false;
+  }
 }
 
-// Log voice commands
-function logVoiceCommand(command, isRecognized) {
+// Enhanced voice command processing with fuzzy matching and confidence threshold
+function processVoiceCommand(transcript, confidence) {
+  // Skip processing if on cooldown
+  if (commandCooldown) return false;
+  
+  // Convert to lowercase and trim for better matching
+  const processedTranscript = transcript.toLowerCase().trim();
+  
+  // Confidence threshold - adjust based on testing
+  const CONFIDENCE_THRESHOLD = 0.4;
+  
+  // Skip low confidence results
+  if (confidence < CONFIDENCE_THRESHOLD) {
+    console.log(`Skipping low confidence (${confidence}) result: ${processedTranscript}`);
+    return false;
+  }
+  
+  // Keywords for each direction with alternatives
+  const upKeywords = ["up", "top", "north", "above"];
+  const downKeywords = ["down", "bottom", "south", "below"];
+  const leftKeywords = ["left", "west"];
+  const rightKeywords = ["right", "east"];
+  const pauseKeywords = ["stop", "pause", "wait", "halt", "freeze"];
+  const resumeKeywords = ["start", "go", "resume", "continue", "play"];
+  
+  // Check for direction commands with word boundary matching
+  let commandRecognized = false;
+  
+  // Helper function to check if any keyword is in the transcript
+  const containsKeyword = (keywords) => {
+    return keywords.some(keyword => 
+      // Check for whole word match using regex
+      new RegExp(`\\b${keyword}\\b`, 'i').test(processedTranscript)
+    );
+  };
+  
+  // Process directional commands
+  if (containsKeyword(upKeywords) && direction.y !== 1) {
+    nextDirection = { x: 0, y: -1 };
+    voiceStatus.textContent = "Command: UP";
+    commandRecognized = true;
+  } else if (containsKeyword(downKeywords) && direction.y !== -1) {
+    nextDirection = { x: 0, y: 1 };
+    voiceStatus.textContent = "Command: DOWN";
+    commandRecognized = true;
+  } else if (containsKeyword(leftKeywords) && direction.x !== 1) {
+    nextDirection = { x: -1, y: 0 };
+    voiceStatus.textContent = "Command: LEFT";
+    commandRecognized = true;
+  } else if (containsKeyword(rightKeywords) && direction.x !== -1) {
+    nextDirection = { x: 1, y: 0 };
+    voiceStatus.textContent = "Command: RIGHT";
+    commandRecognized = true;
+  } else if (containsKeyword(pauseKeywords)) {
+    if (!isPaused) {
+      togglePause();
+      voiceStatus.textContent = "Game paused";
+      commandRecognized = true;
+    }
+  } else if (containsKeyword(resumeKeywords)) {
+    if (isPaused) {
+      togglePause();
+      voiceStatus.textContent = "Game resumed";
+      commandRecognized = true;
+    }
+  }
+  
+  // Add command cooldown to prevent rapid command changes
+  if (commandRecognized) {
+    // Visual feedback
+    container.classList.add('command-received');
+    setTimeout(() => {
+      container.classList.remove('command-received');
+    }, 300);
+    
+    // Set cooldown
+    commandCooldown = true;
+    setTimeout(() => {
+      commandCooldown = false;
+    }, 300); // Short cooldown to prevent accidental double commands
+    
+    // Track last recognized command
+    lastRecognizedCommand = {
+      command: processedTranscript,
+      direction: {...nextDirection},
+      timestamp: Date.now()
+    };
+  }
+  
+  return commandRecognized;
+}
+
+// Log voice commands with enhanced details
+function logVoiceCommand(transcript, isRecognized, confidence) {
   lastVoiceCommands.unshift({
-    command,
+    command: transcript,
     timestamp: new Date().toLocaleTimeString(),
-    recognized: isRecognized
+    recognized: isRecognized,
+    confidence: confidence ? Math.round(confidence * 100) : 0
   });
   
   // Keep only the last MAX_COMMAND_HISTORY commands
@@ -182,22 +538,45 @@ function logVoiceCommand(command, isRecognized) {
   }
 }
 
-// Update command log display
+// Update command log display with enhanced styling
 function updateCommandLog() {
   if (lastVoiceCommands.length === 0) {
     voiceCommandLog.textContent = "No commands detected yet";
     return;
   }
   
-  const logContent = lastVoiceCommands.map(entry => {
-    const statusIndicator = entry.recognized ? '✅' : '❓';
-    return `${statusIndicator} [${entry.timestamp}] "${entry.command}"`;
-  }).join('\n');
+  // Create styled log
+  voiceCommandLog.innerHTML = "";
   
-  voiceCommandLog.textContent = logContent;
+  lastVoiceCommands.forEach(entry => {
+    const logEntry = document.createElement("div");
+    logEntry.className = "command-entry";
+    
+    // Status indicator
+    const statusIndicator = document.createElement("span");
+    statusIndicator.className = `command-status ${entry.recognized ? 'recognized' : 'unrecognized'}`;
+    statusIndicator.textContent = entry.recognized ? '✅' : '❓';
+    
+    // Command text with timestamp
+    const commandText = document.createElement("span");
+    commandText.className = "command-text";
+    commandText.innerHTML = `<span class="command-time">[${entry.timestamp}]</span> "${entry.command}"`;
+    
+    // Confidence indicator
+    const confidenceIndicator = document.createElement("span");
+    confidenceIndicator.className = "command-confidence";
+    confidenceIndicator.textContent = entry.confidence ? `${entry.confidence}%` : "";
+    
+    // Add elements to entry
+    logEntry.appendChild(statusIndicator);
+    logEntry.appendChild(commandText);
+    logEntry.appendChild(confidenceIndicator);
+    
+    voiceCommandLog.appendChild(logEntry);
+  });
 }
 
-// Create/recreate voice recognition instance
+// Improved create/recreate voice recognition instance with better error handling
 function createRecognitionInstance() {
   // First ensure any existing instance is properly stopped
   if (recognition) {
@@ -213,103 +592,132 @@ function createRecognitionInstance() {
     recognition.onresult = null;
     recognition.onerror = null;
     recognition.onend = null;
+    recognition.onstart = null;
+    recognition = null;
   }
   
   // Reset state
   isRecognitionActive = false;
   
-  // Create new instance
-  recognition = new SpeechRecognition();
-  recognition.continuous = true;
-  recognition.interimResults = true;
-  recognition.lang = "en-US";
+  // Check if speech recognition is supported
+  if (!SpeechRecognition) {
+    console.warn("Web Speech API is not supported in this browser.");
+    voiceStatus.textContent = "Voice control not supported in this browser";
+    return false;
+  }
   
-  // Set up event handlers
-  recognition.onresult = (event) => {
-    const lastResult = event.results[event.results.length - 1];
-    const transcript = lastResult[0].transcript.trim().toLowerCase();
+  try {
+    // Create new instance with optimized settings for gaming
+    recognition = new SpeechRecognition();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = "en-US";
+    recognition.maxAlternatives = 3; // Get multiple interpretations for better accuracy
     
-    // Audio volume visualization
-    const confidence = lastResult[0].confidence;
-    voiceLevel.style.width = `${confidence * 100}%`;
-    
-    const isFinal = lastResult.isFinal;
-    let commandRecognized = false;
-    
-    // Process commands - simplified for better recognition
-    if (transcript.includes("up") && direction.y !== 1) {
-      nextDirection = { x: 0, y: -1 };
-      voiceStatus.textContent = "Command: UP";
-      commandRecognized = true;
-    } else if (transcript.includes("down") && direction.y !== -1) {
-      nextDirection = { x: 0, y: 1 };
-      voiceStatus.textContent = "Command: DOWN";
-      commandRecognized = true;
-    } else if (transcript.includes("left") && direction.x !== 1) {
-      nextDirection = { x: -1, y: 0 };
-      voiceStatus.textContent = "Command: LEFT";
-      commandRecognized = true;
-    } else if (transcript.includes("right") && direction.x !== -1) {
-      nextDirection = { x: 1, y: 0 };
-      voiceStatus.textContent = "Command: RIGHT";
-      commandRecognized = true;
-    } else if (transcript.includes("stop") || transcript.includes("pause")) {
-      togglePause();
-      voiceStatus.textContent = isPaused ? "Game paused" : "Game resumed";
-      commandRecognized = true;
-    }
-    
-    if (isFinal) {
-      logVoiceCommand(transcript, commandRecognized);
+    // Set up event handlers
+    recognition.onstart = () => {
+      console.log("Recognition started event fired");
+      isRecognitionActive = true;
+      voiceStatus.textContent = "Voice control active - speak a direction";
+      updateVoiceStatusIndicator(true);
       
-      // Reset volume visualization
-      setTimeout(() => {
-        voiceLevel.style.width = "0%";
-      }, 500);
-    }
-  };
-
-  recognition.onerror = (event) => {
-    console.error("Speech recognition error:", event.error);
+      // Reset attempt counter
+      voiceRecognitionAttempts = 0;
+    };
     
-    if (event.error === 'network') {
-      voiceStatus.textContent = "Network error - check connection";
-    } else if (event.error === 'not-allowed') {
-      voiceStatus.textContent = "Microphone access denied";
-      permissionRequested = false;
-    } else if (event.error === 'aborted') {
-      voiceStatus.textContent = "Recognition aborted";
-    } else {
-      voiceStatus.textContent = `Error: ${event.error}`;
-    }
-    
-    // Log the error
-    logVoiceCommand(`Error: ${event.error}`, false);
-    
-    // Mark as inactive
-    isRecognitionActive = false;
-  };
-
-  recognition.onend = () => {
-    console.log("Recognition ended naturally");
-    isRecognitionActive = false;
-    
-    // Auto-restart only if voice control is active and game is not paused
-    if (isVoiceControlActive && !isPaused) {
-      clearRecognitionTimer();
-      recognitionRestartTimer = setTimeout(() => {
-        if (isVoiceControlActive && !isRecognitionActive && !isPaused) {
-          console.log("Auto-restarting voice recognition after end event");
-          startVoiceRecognition();
+    recognition.onresult = (event) => {
+      // Process all results including interim for responsiveness
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i];
+        const transcript = result[0].transcript.trim();
+        const confidence = result[0].confidence;
+        const isFinal = result.isFinal;
+        
+        // Process command immediately even for interim results
+        const commandRecognized = processVoiceCommand(transcript, confidence);
+        
+        // Audio volume visualization handled separately by audio processing
+        
+        // Log only final results to prevent spam
+        if (isFinal) {
+          logVoiceCommand(transcript, commandRecognized, confidence);
         }
-      }, 1000);
-    }
-  };
+      }
+    };
 
-  return true;
+    recognition.onerror = (event) => {
+      console.error("Speech recognition error:", event.error);
+      
+      if (event.error === 'network') {
+        voiceStatus.textContent = "Network error - check connection";
+      } else if (event.error === 'not-allowed') {
+        voiceStatus.textContent = "Microphone access denied";
+        permissionRequested = false;
+      } else if (event.error === 'aborted') {
+        voiceStatus.textContent = "Recognition aborted";
+      } else {
+        voiceStatus.textContent = `Error: ${event.error}`;
+      }
+      
+      // Log the error
+      logVoiceCommand(`Error: ${event.error}`, false, 0);
+      
+      // Mark as inactive
+      isRecognitionActive = false;
+      updateVoiceStatusIndicator(false);
+      
+      // Auto-restart on certain errors with more aggressive retry for better gameplay
+      if (event.error === 'network' || event.error === 'aborted' || event.error === 'audio-capture') {
+        voiceRecognitionAttempts++;
+        
+        // If we've had too many consecutive errors, recreate the instance
+        if (voiceRecognitionAttempts >= MAX_RECOGNITION_ATTEMPTS) {
+          setTimeout(() => {
+            console.log("Too many errors, recreating recognition instance");
+            createRecognitionInstance();
+            voiceRecognitionAttempts = 0;
+            
+            // Try to start again after recreating
+            if (isVoiceControlActive && !isPaused) {
+              setTimeout(startVoiceRecognition, 300);
+            }
+          }, 500);
+        } else {
+          // Otherwise just try to restart
+          if (isVoiceControlActive && !isPaused) {
+            clearRecognitionTimer();
+            recognitionRestartTimer = setTimeout(startVoiceRecognition, 1000);
+          }
+        }
+      }
+    };
+
+    recognition.onend = () => {
+      console.log("Recognition ended naturally");
+      isRecognitionActive = false;
+      updateVoiceStatusIndicator(false);
+      
+      // Auto-restart only if voice control is active and game is not paused
+      if (isVoiceControlActive && !isPaused) {
+        clearRecognitionTimer();
+        recognitionRestartTimer = setTimeout(() => {
+          if (isVoiceControlActive && !isRecognitionActive && !isPaused) {
+            console.log("Auto-restarting voice recognition after end event");
+            startVoiceRecognition();
+          }
+        }, 500); // Reduced from 1000ms to 500ms for faster recovery
+      }
+    };
+
+    return true;
+  } catch (error) {
+    console.error("Error creating speech recognition instance:", error);
+    voiceStatus.textContent = "Failed to create recognition";
+    return false;
+  }
 }
 
-// Setup voice recognition
+// Setup voice recognition - improved with better initialization
 function setupVoiceRecognition() {
   if (!SpeechRecognition) {
     console.warn("Web Speech API is not supported in this browser.");
@@ -317,10 +725,11 @@ function setupVoiceRecognition() {
     return false;
   }
   
+  // Create a fresh instance
   return createRecognitionInstance();
 }
 
-// Toggle voice control
+// Toggle voice control with improved initialization
 document.getElementById("voice").addEventListener("click", async () => {
   controlMode = "voice";
   isVoiceControlActive = true;
@@ -328,22 +737,35 @@ document.getElementById("voice").addEventListener("click", async () => {
   // Show voice control UI elements
   voiceControls.style.display = "block";
   
+  // Pre-initialize speech recognition
+  preInitializeSpeechRecognition();
+  
   // Request microphone permission if not already done
   if (!permissionRequested) {
-    try {
-      await requestMicrophonePermission();
-      voiceStatus.textContent = "Microphone access granted";
-    } catch (error) {
-      voiceStatus.textContent = "Microphone access denied";
-      console.error("Microphone permission error:", error);
-      alert("Voice control requires microphone access. Please allow microphone access and try again.");
+    voiceStatus.textContent = "Requesting microphone access...";
+    const stream = await requestMicrophonePermission();
+    
+    if (!stream) {
+      // If permission denied, still show the game but with a warning
+      alert("Voice control requires microphone access. The game will start with keyboard controls instead.");
+      controlMode = "keyboard";
+      isVoiceControlActive = false;
+      voiceControls.style.display = "none";
+      resetGame();
+      setTimeout(startGame, 300);
       return;
     }
   }
 
   // Create a fresh recognition instance
   if (setupVoiceRecognition()) {
-    voiceStatus.textContent = "Voice control ready";
+    voiceStatus.textContent = "Voice control ready - say UP, DOWN, LEFT, or RIGHT";
+  } else {
+    // Fallback to keyboard if voice setup fails
+    controlMode = "keyboard";
+    isVoiceControlActive = false;
+    voiceControls.style.display = "none";
+    alert("Failed to initialize voice control. The game will start with keyboard controls instead.");
   }
 
   // Proceed to game page
@@ -369,6 +791,11 @@ document.getElementById("eyes").addEventListener("click", () => {
 const renderGame = () => {
   container.innerHTML = "";
   
+  // Add grid lines for better visibility (optional)
+  const grid = document.createElement("div");
+  grid.className = "game-grid";
+  container.appendChild(grid);
+  
   // Render snake parts
   snake.forEach((part, index) => {
     const snakePart = document.createElement("div");
@@ -379,17 +806,36 @@ const renderGame = () => {
     // Add special class for head
     if (index === 0) {
       snakePart.classList.add("snake-head");
+      
+      // Add direction indicator to head
+      if (direction.x === 1) snakePart.classList.add("facing-right");
+      else if (direction.x === -1) snakePart.classList.add("facing-left");
+      else if (direction.y === 1) snakePart.classList.add("facing-down");
+      else if (direction.y === -1) snakePart.classList.add("facing-up");
     }
     
     container.appendChild(snakePart);
   });
 
-  // Render apple
+  // Render apple with animation
   const appleElement = document.createElement("div");
   appleElement.style.left = apple.x * 5 + "%";
   appleElement.style.top = apple.y * 5 + "%";
   appleElement.classList.add("apple");
+  appleElement.classList.add("apple-pulse"); // Add pulsing animation
   container.appendChild(appleElement);
+  
+  // Add visual indicator for current direction
+  const directionIndicator = document.createElement("div");
+  directionIndicator.className = "direction-indicator";
+  
+  if (direction.x === 1) directionIndicator.textContent = "→";
+  else if (direction.x === -1) directionIndicator.textContent = "←";
+  else if (direction.y === 1) directionIndicator.textContent = "↓";
+  else if (direction.y === -1) directionIndicator.textContent = "↑";
+  else directionIndicator.textContent = "•";
+  
+  container.appendChild(directionIndicator);
 };
 
 // Place apple in a new random position
@@ -417,7 +863,6 @@ const placeApple = () => {
   }
 };
 
-// Move the snake
 const moveSnake = () => {
   // Skip movement if game is paused
   if (isPaused) return;
@@ -448,166 +893,86 @@ const moveSnake = () => {
 
   // Eat apple
   if (head.x === apple.x && head.y === apple.y) {
-    score++;
+    // Increase score
+    score += 10;
     scoreElement.textContent = score;
     
-    // Update highest score if needed
-    if (score > highestScore) {
-      localStorage.setItem("highestScore", score);
-      document.getElementById("highestScore").textContent = score;
-    }
-    
+    // Place new apple
     placeApple();
+    
+    // Speed up slightly
+    speed = Math.max(50, speed - 5);
+    if (gameInterval) {
+      clearInterval(gameInterval);
+      gameInterval = setInterval(gameLoop, speed);
+    }
   } else {
-    snake.pop(); // Remove tail
+    // Remove tail if we didn't eat an apple
+    snake.pop();
   }
-
+  
+  // Render updated game state
   renderGame();
 };
 
-// Game over handling
-function gameOver() {
-  // Stop the game interval
-  if (gameInterval) {
-    clearInterval(gameInterval);
-    gameInterval = null;
-  }
-  
-  // Pause voice recognition
-  stopVoiceRecognition();
-  
-  // Show game over dialog with retry option
-  const retry = confirm(`Game Over! Your score: ${score}\n\nWould you like to try again?`);
-  
-  if (retry) {
-    resetGame();
-    // Short delay before restarting to ensure cleanup is complete
-    setTimeout(() => {
-      startGame();
-    }, 500);
-  } else {
-    showPage(0); // Return to main menu
-  }
-}
-
-// Toggle pause
-function togglePause() {
-  isPaused = !isPaused;
-
-  if (isPaused) {
-    clearInterval(gameInterval);
-    gameInterval = null;
-
-    // Pause voice recognition
-    stopVoiceRecognition();
-    
-    voiceStatus.textContent = "Game paused";
-  } else {
-    gameInterval = setInterval(moveSnake, speed);
-
-    // Resume voice recognition with fresh instance
-    if (isVoiceControlActive) {
-      setupVoiceRecognition();
-      startVoiceRecognition();
-    }
-    
-    voiceStatus.textContent = "Game resumed";
-  }
-}
-
-// Reset game state
+// Reset game to initial state
 function resetGame() {
+  // Reset snake position and direction
   snake = [{ x: 5, y: 5 }];
-  apple = { x: 8, y: 8 };
   direction = { x: 0, y: 0 };
   nextDirection = { x: 0, y: 0 };
+  
+  // Reset game speed
+  speed = originalSpeed;
+  
+  // Reset score
   score = 0;
-  isPaused = false;
-  lastVoiceCommands = [];
-
   scoreElement.textContent = "0";
-
+  
+  // Place initial apple
+  placeApple();
+  
+  // Clear any existing game interval
   if (gameInterval) {
     clearInterval(gameInterval);
     gameInterval = null;
   }
-
+  
+  // Reset pause state
+  isPaused = false;
+  
+  // Render initial state
   renderGame();
-  updateCommandLog();
 }
 
-// Change speed
-document.getElementById("slow").addEventListener("click", () => {
-  speed = 300;
-  originalSpeed = 300;
-  showPage(2);
-});
-
-document.getElementById("medium").addEventListener("click", () => {
-  speed = 200;
-  originalSpeed = 200;
-  showPage(2);
-});
-
-document.getElementById("fast").addEventListener("click", () => {
-  speed = 100;
-  originalSpeed = 100;
-  showPage(2);
-});
-
 // Start the game
-const startGame = () => {
-  resetGame();
-
-  // Set initial direction
-  direction = { x: 1, y: 0 };
-  nextDirection = { x: 1, y: 0 };
-
-  // Start game loop
-  gameInterval = setInterval(moveSnake, speed);
-
-  // Show game page
+function startGame() {
+  // Show the game page
   showPage(3);
-
-  // Configure for selected control mode
-  if (isVoiceControlActive) {
-    voiceControls.style.display = "block";
-    
-    // Request microphone permission if not already granted
-    if (!permissionRequested) {
-      requestMicrophonePermission()
-        .then(() => {
-          // Always create a fresh recognition instance
-          setupVoiceRecognition();
-          // Start recognition with a slight delay to ensure it's ready
-          setTimeout(() => {
-            startVoiceRecognition();
-          }, 300);
-        })
-        .catch(error => {
-          console.error("Microphone permission error:", error);
-          voiceStatus.textContent = "Microphone access denied";
-        });
-    } else {
-      // Always create a fresh recognition instance
-      setupVoiceRecognition();
-      // Start recognition with a slight delay to ensure it's ready
-      setTimeout(() => {
-        startVoiceRecognition();
-      }, 300);
-    }
-  } else {
-    voiceControls.style.display = "none";
+  
+  // Start the game loop
+  gameInterval = setInterval(gameLoop, speed);
+  
+  // Start voice recognition if needed
+  if (controlMode === "voice" && isVoiceControlActive) {
+    startVoiceRecognition();
   }
-};
+  
+  // Set up keyboard controls
+  document.addEventListener("keydown", handleKeyPress);
+}
 
-// Pause button
-document.getElementById("resumeGame").addEventListener("click", togglePause);
+// Main game loop
+function gameLoop() {
+  moveSnake();
+}
 
-// Keyboard controls
-document.addEventListener("keydown", (e) => {
-  if (controlMode !== "keyboard") return;
-
+// Handle keyboard input
+function handleKeyPress(e) {
+  // Ignore if using voice control
+  if (controlMode === "voice" && isVoiceControlActive) return;
+  
+  // Handle arrow keys
   switch (e.key) {
     case "ArrowUp":
       if (direction.y !== 1) nextDirection = { x: 0, y: -1 };
@@ -621,84 +986,46 @@ document.addEventListener("keydown", (e) => {
     case "ArrowRight":
       if (direction.x !== -1) nextDirection = { x: 1, y: 0 };
       break;
-    case " ": // Spacebar
+    case " ":
+      // Space bar toggles pause
       togglePause();
       break;
   }
-});
+}
 
-// Prevent browser from scrolling when using arrow keys
-window.addEventListener("keydown", function(e) {
-  if(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].indexOf(e.key) > -1) {
-    e.preventDefault();
-  }
-});
-
-// Add additional debugging display
-function updateDebugInfo() {
-  // Add debug info to voice status if needed
-  if (isVoiceControlActive) {
-    const recognitionStateText = isRecognitionActive ? "ACTIVE" : "INACTIVE";
-    const debugText = document.createElement("div");
-    debugText.classList.add("debug-info");
-    debugText.textContent = `Recognition: ${recognitionStateText} | Game: ${isPaused ? "PAUSED" : "RUNNING"}`;
-    voiceControls.appendChild(debugText);
-    
-    // Remove after a short while
-    setTimeout(() => {
-      if (debugText.parentNode) {
-        debugText.parentNode.removeChild(debugText);
-      }
-    }, 3000);
+// Toggle pause state
+function togglePause() {
+  isPaused = !isPaused;
+  
+  // Update UI to show pause state
+  container.classList.toggle("paused", isPaused);
+  
+  // If using voice control, update status
+  if (controlMode === "voice") {
+    voiceStatus.textContent = isPaused ? "Game paused - say 'resume' to continue" : "Voice control active";
   }
 }
 
-// Preload sound to avoid 404 errors
-const preloadSound = () => {
-  beepSound.load();
-  beepSound.volume = 0.5; // Lower volume
+// Game over function
+function gameOver() {
+  // Stop the game loop
+  clearInterval(gameInterval);
+  gameInterval = null;
   
-  // Test if sound can play
-  beepSound.play()
-    .then(() => {
-      // Pause it immediately, just testing
-      beepSound.pause();
-      beepSound.currentTime = 0;
-    })
-    .catch(error => {
-      console.warn("Sound preload failed:", error);
-      // Continue anyway, sound is not critical
-    });
-};
-
-// Add a test/debug button for voice
-const addVoiceTestButton = () => {
-  const testBtn = document.createElement("button");
-  testBtn.textContent = "Test Voice Recognition";
-  testBtn.classList.add("voice-test-btn");
-  testBtn.addEventListener("click", () => {
-    if (isVoiceControlActive) {
-      // Recreate recognition instance
-      setupVoiceRecognition();
-      
-      // Try to start a fresh instance
-      stopVoiceRecognition();
-      setTimeout(() => {
-        startVoiceRecognition();
-        updateDebugInfo();
-        voiceStatus.textContent = "Voice recognition restarted";
-      }, 500);
-    } else {
-      alert("Please select voice control mode first");
-    }
-  });
+  // Stop voice recognition if active
+  if (isRecognitionActive) {
+    stopVoiceRecognition();
+  }
   
-  // Append to voice controls section
-  voiceControls.appendChild(testBtn);
-};
-
-// Initialize the game
-preloadSound();
-showPage(0);
-renderGame();
-addVoiceTestButton();
+  // Update highest score if needed
+  if (score > highestScore) {
+    localStorage.setItem("highestScore", score);
+    document.getElementById("highestScore").textContent = score;
+  }
+  
+  // Show game over message
+  alert(`Game Over! Your score: ${score}`);
+  
+  // Go back to main menu
+  showPage(0);
+}
